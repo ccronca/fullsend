@@ -26,14 +26,16 @@ scope covers GitHub, GitLab, and Jira** (see [Scope](#scope-v1)).
 ## Scope (v1)
 
 v1 adapters and examples target **GitHub** webhooks, **GitLab** cron-poll
-input, and **Jira poll** input:
+and native-webhook input, and **Jira poll** input:
 
 - `source.system` is `github`, `gitlab`, `jira`, `manual`, or `schedule`.
 - `repo` is the target Fullsend repository (`owner/repo` for GitHub,
   `group/subgroup/project` for GitLab) for all systems — including Jira poll
   events (see [jira-poll-adapter.md](jira-poll-adapter.md)).
 - The `gha-event` input driver is the production GitHub adapter; `gitlab-poll`
-  is the production GitLab adapter ([ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md));
+  is the production GitLab poll adapter ([ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md));
+  `gitlab-webhook` is the planned GitLab native-webhook adapter
+  ([ADR 0125](../../../ADRs/0125-gitlab-hybrid-webhook-poller-dispatch.md));
   `jira-poll` is the production Jira poll adapter; `json` supports tests and
   replay.
 - `entity.kind: conversation` covers GitHub Discussions and future chat
@@ -70,6 +72,7 @@ Input drivers map native forge events into this struct:
 |--------|--------|-----------|
 | `gha-event` | `GITHUB_EVENT_PATH` + `gh` snapshot for labels and change-proposal metadata | Production; Discussions → `entity.kind: conversation` planned ([ADR 0086](../../../ADRs/0086-conversation-surface-for-agent-participation.md)) |
 | `gitlab-poll` | GitLab CI event payload (cron-polled; [ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md)) | Production (poll) |
+| `gitlab-webhook` | `TRIGGER_PAYLOAD`, a file-type CI/CD variable whose value is a path to the webhook body delivered by a native "use a webhook" pipeline trigger pinned to the protected default branch: the file's contents are **untrusted hinting only** (resource IDs, event type). The adapter MUST accept only GitLab's own file-type `TRIGGER_PAYLOAD` variable — never a caller-supplied path override, and never following a symlink out of the runner-provided location — read the file, and re-fetch the referenced entities from the GitLab API. Provenance splits by field: `entity`, `state`, `actor`, and `state.labels` MUST come **solely** from the project-pinned API re-fetch, failing closed on any missing or mismatched resource. `transition.kind` (and `source.raw_type`/`raw_action`) has no API-snapshot equivalent — a resource `GET` cannot distinguish opened/labeled/synchronized/merged for an MR, or added/edited for a note — so it MAY be taken from the payload's object-kind/action hint **only after** the payload action is mapped onto the v1 transition vocabulary and validated by the fail-closed consistency checks enumerated in [GitLab webhook transition provenance](#gitlab-webhook-transition-provenance-gitlab-webhook) below. Any action that contradicts the snapshot, or that cannot be checked against it, MUST fail closed. Required transition sub-objects follow the same field-split: `transition.comment` and `transition.review` MUST be populated from the re-fetch, while `transition.label` (`name` and `action`, which a current-state snapshot cannot recover) is taken from the payload's `changes.labels` diff and admitted only after the present/absent snapshot check — see the subsection for the per-label fan-out. This is **not** a pure snapshot re-fetch — the payload action is untrusted until the check passes. The enumerated checks are *current-state* predicates and do not by themselves prove the action just occurred, so **snapshot-consistent replay** remains a named residual trigger-token risk (see the subsection); the adapter MUST use any event-time evidence the re-fetch exposes to bind the action to a recent occurrence and fail closed when it cannot. Any identifier read from the payload MUST be validated against its expected format before use in an API path, and the payload's contents MUST NOT be logged or echoed. **Project identity** MUST come from the running job's `CI_JOB_TOKEN` job record (`GET /api/v4/job`) as the **sole** project-identity source — never from the trigger-overridable `CI_PROJECT_ID`, `CI_API_V4_URL`, `CI_SERVER_URL`, or `FULLSEND_GITLAB_URL` environment values, which the adapter MUST ignore for identity. An `id_tokens` JWT is **not** an independent or interchangeable identity source (it lands in an ordinary env var a same-named trigger variable can outrank); if a JWT is used at all it MUST be **bound** to the `CI_JOB_TOKEN`-authenticated job record by matching its `job_id`/`project_id` claims — in addition to JWKS signature verification — and MUST NOT stand alone. **Host/base-URL** pinning is not yet specified — [ADR 0125](../../../ADRs/0125-gitlab-hybrid-webhook-poller-dispatch.md) tracks it as an open, ship-gating residual risk in its Consequences section, and this adapter MUST NOT be implemented until that gap is closed | Planned (webhook fast-path) |
 | `jira-poll` | Jira issue search + changelog/comments since `lastCheck` ([jira-poll-adapter.md](jira-poll-adapter.md), [ADR 0063](../../../ADRs/0063-polling-based-work-discovery.md)) | Production (poll) |
 | `json` | stdin or `--input-file` | Tests, replay |
 
@@ -303,7 +306,7 @@ GitLab is a normative v1 source system ([gitlab-implementation.md](../../../prob
 
 | Concern | Mapping |
 |---------|---------|
-| Input driver | `gitlab-poll` from GitLab CI event payload (cron-polled; see [ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md)) |
+| Input driver | `gitlab-poll` (production, cron-polled; [ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md)) and `gitlab-webhook` (planned fast-path from the file `TRIGGER_PAYLOAD` points to, re-fetched with a `CI_JOB_TOKEN`-pinned project identity — host/base-URL pin still open — and fail-closed on mismatch; see the Adapters table above; [ADR 0125](../../../ADRs/0125-gitlab-hybrid-webhook-poller-dispatch.md)) |
 | `source.system` | `gitlab` |
 | `repo` slug | Nested group path (`group/subgroup/project`) — `repo_path` pattern supports multi-segment paths |
 | MR events | Cron-polled MR → `entity.kind: change_proposal` (native `merge_request_event` dispatch removed in [#7322](https://github.com/fullsend-ai/fullsend/issues/7322); see [ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md)) |
@@ -312,3 +315,60 @@ GitLab is a normative v1 source system ([gitlab-implementation.md](../../../prob
 | MR closed (unmerged) | Cron poll (`closed_at` > watermark, `merged_at` empty) → `transition.kind: closed` (retro) |
 | Notes | `note` → `transition.kind: comment_added` |
 | Role mapping | Guest→`read`, Reporter→`triage`, Developer→`write`, Maintainer→`maintain`, Owner→`admin` |
+
+The MR/note rows above are the **cron-poll** watermark mappings. The webhook
+fast-path derives the transition from the payload action instead of a
+watermark — see the next subsection.
+
+#### GitLab webhook transition provenance (`gitlab-webhook`)
+
+For the webhook fast-path, `transition.kind` (and `source.raw_type`/
+`raw_action`) is derived from the payload's `object_kind`/action hint mapped
+onto the v1 transition vocabulary, then validated against the project-pinned
+re-fetch. GitLab action names are **not** the v1 vocabulary and MUST be
+mapped:
+
+| `object_kind` | payload action | `transition.kind` | Snapshot check (else MUST fail closed) |
+|---------------|----------------|-------------------|----------------------------------------|
+| `merge_request` | `open` | `opened` | MR exists and is open |
+| `merge_request` | `reopen` | `reopened` (or `opened`) | MR exists and is open |
+| `merge_request` | `merge` | `merged` | `merged_at` set |
+| `merge_request` | `close` | `closed` | `closed_at` set and `merged_at` empty |
+| `merge_request` | `update` + `changes.labels` | `label_changed` (one per label diffed) | each named label present (add) / absent (remove) as claimed |
+| `merge_request` | `update` (other) | `synchronized`/`edited`/`marked_ready` | **uncheckable as a unit → MUST fail closed** unless a specific, named sub-check is defined |
+| `note` | create | `comment_added` | referenced note exists in the re-fetch |
+| `issue` | `open`/`reopen`/`close` | `opened`/`reopened`/`closed` | issue exists in the claimed state |
+| `issue` | `update` + `changes.labels` | `label_changed` (one per label diffed) | each named label present (add) / absent (remove) as claimed |
+| `issue` | `update` (other) | — | **uncheckable as a unit → MUST fail closed** |
+
+GitLab emits no dedicated `labeled` action; label changes arrive on both
+merge requests and issues as an `update` with `changes.labels`, so the
+adapter MUST fan that case out to `label_changed` and MUST NOT accept a bare
+`update` (no `changes.labels`) as a routable transition. `changes.labels` is
+a previous/current array that can add and remove several labels in one
+webhook; the adapter MUST emit **one `NormalizedEvent` per label diffed**
+(each carrying its own `transition.label`), or fail closed when the diff
+cannot be resolved to discrete label add/remove pairs.
+
+Transition sub-object provenance: `transition.comment` (`id`, `body`,
+`command`, `instruction`) and `transition.review` MUST come from the
+re-fetch, not the payload. `transition.label` is the exception — a
+current-state snapshot cannot recover *which* label changed or *how* — so
+its `name` **and** `action` (`added`/`removed`, both schema-required) are
+taken from the payload's `changes.labels` diff, admitted only **after** the
+present/absent snapshot check confirms the claimed end state (named label
+present for `added`, absent for `removed`).
+
+**Residual replay risk.** The snapshot checks above are *current-state*
+predicates — they reject an action that contradicts the resource's state,
+but they do not by themselves prove the action *just occurred*. Where the
+`CI_JOB_TOKEN`-pinned re-fetch exposes event-time evidence (resource events,
+system notes, or a timestamp comparable to a per-project watermark), the
+adapter MUST use it to bind the claimed action to a recent occurrence and
+MUST fail closed when the action is not uniquely determined. Absent such
+evidence, a trigger-token holder can re-fire a snapshot-consistent
+historical action (e.g. replay an old note as `comment_added`); this
+**snapshot-consistent replay** is a named residual trigger-token risk that
+the poller/dedup backstop narrows but does not fully close, and
+[ADR 0125](../../../ADRs/0125-gitlab-hybrid-webhook-poller-dispatch.md)
+gates the fast-path on it.

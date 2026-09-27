@@ -24,6 +24,18 @@ Date: 2026-06-13
 
 Accepted
 
+The dispatch topology (native-CI two-path, then pure cron-polling after
+[#7322](https://github.com/fullsend-ai/fullsend/issues/7322)) is superseded
+by [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md). The credential
+model, poller internals, HMAC dispatch signing, and forge-interface
+extensions remain current. Of this ADR's security guardrails, the
+protected/masked CI variable model, the poller reconciliation backstop, and
+the in-job dispatch gate remain current; the "no inbound attack surface / no
+webhook parser / no trigger token" and "events read only from the GitLab
+API, never from spoofable webhook payloads" properties are **superseded** by
+ADR 0125's webhook fast-path — see ADR 0125's trust boundaries and
+trigger-token threat model for the new inbound-surface controls.
+
 <!-- ADRs are point-in-time records, but not fully frozen after acceptance.
      Minor annotations are welcome: cross-references to related ADRs, short
      notes linking to newer decisions, or clarifying remarks. However, do not
@@ -31,6 +43,12 @@ Accepted
      the decision itself needs to change, write a new ADR that supersedes this
      one. For evolving design narrative, use docs/architecture.md. -->
 
+> **Update (2026-09, #7758):** Dispatch topology is superseded by
+> [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md): a GitLab-native
+> webhook fast-path with this ADR's cron-poller as the reconciliation
+> backstop. The Decision below is the historical record; do not treat
+> poll-only dispatch as current.
+>
 > **Update (2026-07, #5556):** The child-pipeline output driver described in
 > this ADR was replaced by direct API-triggered pipelines
 > (`POST /projects/:id/pipeline`). The poller now creates standalone pipelines
@@ -791,4 +809,5 @@ template scaffolding, and install flow.
 - [ADR 0054](0054-require-authorization-on-all-agent-dispatch-paths.md) — authorization on all dispatch paths (slash command ACL)
 - [ADR 0061](0061-harness-cel-dispatch.md) — harness CEL triggers, dispatch drivers, and NormalizedEvent schema
 - [ADR 0063](0063-polling-based-work-discovery.md) — polling-based work discovery via dispatch drivers (`fullsend poll`, input/output driver architecture)
+- [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md) — hybrid GitLab dispatch (webhook fast-path + this ADR's poller as backstop)
 - [NormalizedEvent v1](../normative/normalized-event/v1/)
